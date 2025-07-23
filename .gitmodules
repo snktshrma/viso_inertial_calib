@@ -1,0 +1,6 @@
+[submodule "external/kalibr"]
+	path = external/kalibr
+	url = https://github.com/ethz-asl/kalibr.git
+[submodule "external/allan_ros2"]
+	path = external/allan_ros2
+	url = https://github.com/CruxDevStuff/allan_ros2.git
