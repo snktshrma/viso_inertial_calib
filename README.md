@@ -1,4 +1,4 @@
-# viso_inertial_calib
+# [WIP] viso_inertial_calib
 
 This repository provides a simple pipeline for calibrating an IMU and camera using
 [allan_ros2](https://github.com/CruxDevStuff/allan_ros2) and
