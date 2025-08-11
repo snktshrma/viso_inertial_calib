@@ -1,0 +1,36 @@
+# Example AprilGrid configuration for camera calibration
+# Modify these parameters according to your actual AprilGrid
+
+target_type: 'aprilgrid'
+tagCols: 6          # Number of columns in the grid
+tagRows: 6          # Number of rows in the grid
+tagSize: 0.088      # Size of each AprilTag in meters (8.8 cm)
+tagSpacing: 0.3     # Spacing between tags in meters (30 cm)
+
+# Alternative configurations for different grid sizes:
+# 
+# Small grid (4x4):
+# tagCols: 4
+# tagRows: 4
+# tagSize: 0.06
+# tagSpacing: 0.2
+#
+# Large grid (8x8):
+# tagCols: 8
+# tagRows: 8
+# tagSize: 0.12
+# tagSpacing: 0.4
+#
+# Standard grid (6x6):
+# tagCols: 6
+# tagRows: 6
+# tagSize: 0.088
+# tagSpacing: 0.3
+
+# Notes:
+# - tagSize should match the physical size of your AprilTags
+# - tagSpacing should be the center-to-center distance between adjacent tags
+# - Ensure the grid is printed on a rigid, flat surface
+# - Use high-contrast printing (black tags on white background)
+# - Avoid reflections and shadows during calibration
+

@@ -1,68 +1,216 @@
 #!/usr/bin/env bash
 set -e
 
-# Pipeline for IMU and camera calibration
-# Requires ROS 2 Humble with colcon and docker installed.
-
 if [ "$#" -ne 4 ]; then
     echo "Usage: $0 BAG_IMU BAG_CAM BAG_CAM_IMU APRILGRID_YAML" >&2
+    echo "Example: $0 imu_stationary.bag camera_intrinsics.bag vio_calibration.bag aprilgrid.yaml" >&2
     exit 1
 fi
 
-IMU_BAG=$1
-CAM_BAG=$2
-VIO_BAG=$3
-APRIL=$4
+imu_bag=$1
+cam_bag=$2
+vio_bag=$3
+april=$4
 
-WORKDIR=$(pwd)
-ALLAN_WS=$WORKDIR/allan_ws
-
-# Convert camera and VIO bags from ros2 to rosbag for Kalibr
-ROS1_CAM_BAG="${CAM_BAG%.*}_ros1"
-ROS1_VIO_BAG="${VIO_BAG%.*}_ros1"
-rosbags-convert --src "$CAM_BAG" --dst "${ROS1_CAM_BAG%.bag}" 
-rosbags-convert --src "$VIO_BAG" --dst "${ROS1_VIO_BAG%.bag}"
-
-# Allan params est,
-mkdir -p "$ALLAN_WS/src"
-if [ ! -d "$ALLAN_WS/src/allan_ros2" ]; then
-    cp -r "$WORKDIR/external/allan_ros2" "$ALLAN_WS/src/allan_ros2"
+# check if files exist
+if [ ! -f "$imu_bag" ]; then
+    echo "Error: IMU bag file '$imu_bag' not found" >&2
+    exit 1
 fi
 
-cat > "$ALLAN_WS/src/allan_ros2/config/config.yaml" <<EOF2
+if [ ! -f "$cam_bag" ]; then
+    echo "Error: Camera bag file '$cam_bag' not found" >&2
+    exit 1
+fi
+
+if [ ! -f "$vio_bag" ]; then
+    echo "Error: VIO bag file '$vio_bag' not found" >&2
+    exit 1
+fi
+
+if [ ! -f "$april" ]; then
+    echo "Error: AprilGrid YAML file '$april' not found" >&2
+    exit 1
+fi
+
+workdir=$(pwd)
+allan_ws=$workdir/allan_ws
+
+echo "Starting calibration..."
+echo "IMU: $imu_bag"
+echo "Cam: $cam_bag"
+echo "VIO: $vio_bag"
+echo "Grid: $april"
+echo ""
+
+# check tools
+if ! command -v rosbags-convert &> /dev/null; then
+    echo "Error: rosbags-convert not found. Install with: pip install rosbags" >&2
+    exit 1
+fi
+
+if ! command -v docker &> /dev/null; then
+    echo "Error: docker not found." >&2
+    exit 1
+fi
+
+# convert bags to ros1
+echo "Converting bags..."
+ros1_cam="cam_ros1.bag"
+ros1_vio="vio_ros1.bag"
+
+rosbags-convert --src "$cam_bag" --dst "$ros1_cam"
+rosbags-convert --src "$vio_bag" --dst "$ros1_vio"
+
+echo "Bags converted."
+echo ""
+
+# allan variance setup
+echo "Setting up allan variance..."
+mkdir -p "$allan_ws/src"
+if [ ! -d "$allan_ws/src/allan_ros2" ]; then
+    cp -r "$workdir/external/allan_ros2" "$allan_ws/src/allan_ros2"
+fi
+
+# config for allan
+cat > "$allan_ws/src/allan_ros2/config/config.yaml" <<EOF
 allan_node:
   ros__parameters:
     topic: /imu
-    bag_path: $IMU_BAG
+    bag_path: $imu_bag
     msg_type: ros
     publish_rate: 200
     sample_rate: 200
-EOF2
+EOF
 
-cd "$ALLAN_WS"
+# install deps
+pip3 install matplotlib numpy scipy pyyaml
+
+cd "$allan_ws"
 rosdep install --from-paths src -y --ignore-src
+
+echo "Building..."
 colcon build --packages-select allan_ros2
-source install/setup.bash
 
-# run allan_ros2
-ros2 launch allan_ros2 allan_node.py
-
-# imu.yaml
-python3 src/allan_ros2/scripts/analysis.py --data deviation.csv --config src/allan_ros2/config/config.yaml
-cp imu.yaml "$WORKDIR/imu.yaml"
-cd "$WORKDIR"
-
-# Camera intrinsics
-# ussing kalibr Docker image
-if ! docker image inspect kalibr:ros1 > /dev/null 2>&1; then
-    docker build -t kalibr:ros1 external/kalibr -f external/kalibr/Dockerfile_ros1_20_04
+if [ $? -ne 0 ]; then
+    echo "Build failed" >&2
+    exit 1
 fi
 
-docker run --rm -v "$WORKDIR":/data -it kalibr:ros1 bash -c \
-    "kalibr_calibrate_cameras --bag /data/$ROS1_CAM_BAG --target /data/$APRIL --models pinhole-radtan --topics /camera/image_raw"
+echo "Build done."
+echo ""
 
-cp camchain*.yaml camchain.yaml
+source install/setup.bash
 
-# Viso-inertial extrinsics
-docker run --rm -v "$WORKDIR":/data -it kalibr:ros1 bash -c \
-    "kalibr_calibrate_imu_camera --bag /data/$ROS1_VIO_BAG --target /data/$APRIL --cam /data/camchain.yaml --imu /data/imu.yaml"
+# run allan analysis
+echo "Running allan variance..."
+echo "This might take a while..."
+
+ros2 launch allan_ros2 allan_node.py &
+allan_pid=$!
+
+sleep 10
+
+if ! kill -0 $allan_pid 2>/dev/null; then
+    echo "allan node crashed" >&2
+    exit 1
+fi
+
+echo "Analysis running..."
+wait $allan_pid
+
+echo "Allan done."
+echo ""
+
+# generate imu calib
+echo "Generating IMU params..."
+if [ -f "deviation.csv" ]; then
+    python3 src/allan_ros2/scripts/analysis.py --data deviation.csv --config src/allan_ros2/config/config.yaml
+    
+    if [ -f "imu.yaml" ]; then
+        echo "IMU calib generated."
+        cp imu.yaml "$workdir/imu.yaml"
+    else
+        echo "Failed to generate imu.yaml" >&2
+        exit 1
+    fi
+else
+    echo "deviation.csv not found" >&2
+    exit 1
+fi
+
+cd "$workdir"
+echo ""
+
+# camera calib
+echo "Camera calibration..."
+
+if ! docker image inspect kalibr:ros1 > /dev/null 2>&1; then
+    echo "Building kalibr docker..."
+    docker build -t kalibr:ros1 external/kalibr -f external/kalibr/Dockerfile_ros1_20_04
+    
+    if [ $? -ne 0 ]; then
+        echo "Docker build failed" >&2
+        exit 1
+    fi
+fi
+
+echo "Running cam calib..."
+docker run --rm -v "$workdir":/data -it kalibr:ros1 bash -c \
+    "kalibr_calibrate_cameras --bag /data/$ros1_cam --target /data/$april --models pinhole-radtan --topics /camera/image_raw"
+
+if [ $? -ne 0 ]; then
+    echo "Camera calib failed" >&2
+    exit 1
+fi
+
+# find camchain file
+if ls camchain*.yaml 1> /dev/null 2>&1; then
+    camchain_file=$(ls camchain*.yaml | head -1)
+    cp "$camchain_file" camchain.yaml
+    echo "Camera calib done: $camchain_file"
+else
+    echo "Camera calib file not found" >&2
+    exit 1
+fi
+
+echo ""
+
+# vio calib
+echo "VIO calibration..."
+echo "Running IMU-camera calib..."
+
+docker run --rm -v "$workdir":/data -it kalibr:ros1 bash -c \
+    "kalibr_calibrate_imu_camera --bag /data/$ros1_vio --target /data/$april --cam /data/camchain.yaml --imu /data/imu.yaml"
+
+if [ $? -ne 0 ]; then
+    echo "VIO calib failed" >&2
+    exit 1
+fi
+
+echo ""
+
+# done
+echo "Calibration complete!"
+echo ""
+echo "Files generated:"
+if [ -f "imu.yaml" ]; then
+    echo "  imu.yaml"
+fi
+if [ -f "camchain.yaml" ]; then
+    echo "  camchain.yaml"
+fi
+if ls imu-*.yaml 1> /dev/null 2>&1; then
+    echo "  imu-*.yaml"
+fi
+
+echo ""
+echo "Ready for VINS-Fusion etc."
+echo ""
+
+# cleanup
+echo "Cleaning up..."
+rm -f "$ros1_cam" "$ros1_vio"
+rm -rf "$allan_ws"
+
+echo "Done!"
